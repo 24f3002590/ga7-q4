@@ -1,4 +1,3 @@
-import json
 import re
 from urllib.parse import urlsplit
 
@@ -12,113 +11,109 @@ ALLOWED_HOSTS = {
     "app-teee7zh.example",
 }
 
-CHANNELS = {"html", "markdown", "url", "sql", "shell"}
+CHANNELS = {
+    "html",
+    "markdown",
+    "url",
+    "sql",
+    "shell",
+}
 
 
-# ------------------------------------------------------------
-# Schema
-# ------------------------------------------------------------
+# ============================================================
+# RESPONSE
+# ============================================================
 
-def result(reason: str):
+def respond(reason: str):
     return JSONResponse(
+        status_code=200,
         content={
             "safe": reason == "SAFE",
             "reason": reason,
         },
-        status_code=200,
     )
 
 
-# ------------------------------------------------------------
-# EXACT one-pass decoding
+# ============================================================
+# ONE-PASS DECODING
 #
-# percent escapes -> HTML entities -> \uXXXX
-# ------------------------------------------------------------
+# percent escapes
+#       ↓
+# HTML entities
+#       ↓
+# \uXXXX
+# ============================================================
 
 PERCENT_RE = re.compile(r"%([0-9A-Fa-f]{2})")
 
 ENTITY_RE = re.compile(
-    r"""
-    &(?:
-        lt|gt|quot|apos|amp
-        |
-        \#[0-9]+
-        |
-        \#x[0-9A-Fa-f]+
-    );
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"&(?:lt|gt|quot|apos|amp);"
+    r"|&#[0-9]+;"
+    r"|&#x[0-9A-Fa-f]+;",
+    re.IGNORECASE,
 )
 
 UNICODE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})")
 
 
-def decode_percent_once(s: str) -> str:
-    """
-    Decode valid %XX escapes once.
-
-    Do not recursively decode.
-    Do not turn malformed percent sequences into replacement chars.
-    """
-
-    def repl(m):
+def decode_percent(s: str) -> str:
+    def replace(m):
         return chr(int(m.group(1), 16))
 
-    return PERCENT_RE.sub(repl, s)
+    return PERCENT_RE.sub(replace, s)
 
 
-def decode_entities_once(s: str) -> str:
-    def repl(m):
-        token = m.group(0).lower()
+def decode_html_entities(s: str) -> str:
+    def replace(m):
+        token = m.group(0)
+        lower = token.lower()
 
-        if token == "&lt;":
+        if lower == "&lt;":
             return "<"
-        if token == "&gt;":
+        if lower == "&gt;":
             return ">"
-        if token == "&quot;":
+        if lower == "&quot;":
             return '"'
-        if token == "&apos;":
+        if lower == "&apos;":
             return "'"
-        if token == "&amp;":
+        if lower == "&amp;":
             return "&"
 
         body = token[2:-1]
 
         try:
-            if body.startswith("#x"):
+            if body.lower().startswith("#x"):
                 return chr(int(body[2:], 16))
-            if body.startswith("#"):
-                return chr(int(body[1:], 10))
-        except (ValueError, OverflowError):
-            pass
+            return chr(int(body[1:], 10))
+        except Exception:
+            return token
 
-        return m.group(0)
-
-    return ENTITY_RE.sub(repl, s)
+    return ENTITY_RE.sub(replace, s)
 
 
-def decode_unicode_once(s: str) -> str:
-    def repl(m):
+def decode_unicode(s: str) -> str:
+    def replace(m):
         return chr(int(m.group(1), 16))
 
-    return UNICODE_RE.sub(repl, s)
+    return UNICODE_RE.sub(replace, s)
 
 
 def decode_once(s: str) -> str:
-    s = decode_percent_once(s)
-    s = decode_entities_once(s)
-    s = decode_unicode_once(s)
+    s = decode_percent(s)
+    s = decode_html_entities(s)
+    s = decode_unicode(s)
     return s
 
 
-# ------------------------------------------------------------
-# URL extraction
-# ------------------------------------------------------------
+# ============================================================
+# URL EXTRACTION
+# ============================================================
 
-HTML_ATTR_RE = re.compile(
+HTML_ATTRIBUTE_RE = re.compile(
     r"""
     \b(?:src|href)
-    \s*=\s*
+    \s*=
+    \s*
     (?:
         "([^"]*)"
         |
@@ -128,41 +123,117 @@ HTML_ATTR_RE = re.compile(
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
-MARKDOWN_TARGET_RE = re.compile(
-    r"""
-    \]\(
-    \s*
-    (
-        (?:
-            <[^>]*>
-            |
-            [^)\s]+
-        )
-    )
-    """,
-    re.VERBOSE | re.DOTALL,
-)
+
+def extract_html_urls(s: str):
+    result = []
+
+    for match in HTML_ATTRIBUTE_RE.finditer(s):
+        value = match.group(1)
+
+        if value is None:
+            value = match.group(2)
+
+        result.append(value)
+
+    return result
+
+
+def extract_markdown_urls(s: str):
+    result = []
+
+    pos = 0
+
+    while True:
+        start = s.find("](", pos)
+
+        if start == -1:
+            break
+
+        i = start + 2
+
+        # Skip whitespace after ](
+        while i < len(s) and s[i].isspace():
+            i += 1
+
+        if i >= len(s):
+            break
+
+        # <url> form
+        if s[i] == "<":
+            end = s.find(">", i + 1)
+
+            if end == -1:
+                pos = i + 1
+                continue
+
+            result.append(s[i + 1:end])
+
+            close = s.find(")", end + 1)
+
+            if close == -1:
+                pos = end + 1
+            else:
+                pos = close + 1
+
+            continue
+
+        # Normal markdown target.
+        # Find closing ')' while respecting nested parentheses.
+        target_start = i
+        depth = 0
+        quote = None
+
+        while i < len(s):
+            c = s[i]
+
+            if quote:
+                if c == quote:
+                    quote = None
+
+            elif c in ("'", '"'):
+                quote = c
+
+            elif c == "(":
+                depth += 1
+
+            elif c == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+
+            i += 1
+
+        if i >= len(s):
+            break
+
+        target = s[target_start:i].strip()
+
+        # Optional markdown title:
+        # [x](URL "title")
+        if target:
+            if target.startswith("http://") or target.startswith("https://"):
+                pass
+            elif target.startswith("//"):
+                pass
+            else:
+                # For arbitrary schemes and relative references, take
+                # the first whitespace-delimited target.
+                target = target.split(None, 1)[0]
+
+            if target:
+                result.append(target)
+
+        pos = i + 1
+
+    return result
 
 
 def extract_urls(channel: str, output: str):
     if channel == "html":
-        urls = []
-        for m in HTML_ATTR_RE.finditer(output):
-            urls.append(m.group(1) if m.group(1) is not None else m.group(2))
-        return urls
+        return extract_html_urls(output)
 
     if channel == "markdown":
-        urls = []
-        for m in MARKDOWN_TARGET_RE.finditer(output):
-            value = m.group(1)
-
-            # Markdown permits <url> targets.
-            if value.startswith("<") and value.endswith(">"):
-                value = value[1:-1]
-
-            urls.append(value)
-
-        return urls
+        return extract_markdown_urls(output)
 
     if channel == "url":
         return [output.strip()]
@@ -170,56 +241,59 @@ def extract_urls(channel: str, output: str):
     return []
 
 
-# ------------------------------------------------------------
-# Dangerous schemes
-# ------------------------------------------------------------
+# ============================================================
+# SCHEMES
+# ============================================================
 
 DANGEROUS_SCHEME_RE = re.compile(
     r"(?:javascript|data|vbscript)\s*:",
     re.IGNORECASE,
 )
 
-ANY_SCHEME_RE = re.compile(
-    r"^[A-Za-z][A-Za-z0-9+.-]*\s*:"
+SCHEME_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9+.-]*)\s*:"
 )
 
 
-def dangerous_scheme(channel: str, output: str) -> bool:
-    # Explicit dangerous schemes anywhere in the text.
+def has_dangerous_scheme(channel: str, output: str) -> bool:
+
+    # Explicit textual dangerous schemes.
     if DANGEROUS_SCHEME_RE.search(output):
         return True
 
-    # Every extracted URL must either be relative or use HTTP(S).
+    # Extracted URLs.
     for raw in extract_urls(channel, output):
+
         value = raw.strip()
 
         if not value:
             continue
 
-        # Protocol-relative is explicitly HTTPS for this task.
-        candidate = "https:" + value if value.startswith("//") else value
+        # Protocol-relative URL is HTTPS.
+        if value.startswith("//"):
+            candidate = "https:" + value
+        else:
+            candidate = value
 
-        try:
-            parsed = urlsplit(candidate)
-        except ValueError:
-            # If it visibly has a scheme, it is not a permitted one.
-            if ANY_SCHEME_RE.match(value):
-                return True
-            continue
+        match = SCHEME_RE.match(candidate)
 
-        if parsed.scheme:
-            if parsed.scheme.lower() not in ("http", "https"):
+        if match:
+            scheme = match.group(1).lower()
+
+            if scheme not in {"http", "https"}:
                 return True
 
     return False
 
 
-# ------------------------------------------------------------
-# External exfiltration
-# ------------------------------------------------------------
+# ============================================================
+# EXTERNAL EXFILTRATION
+# ============================================================
 
-def external_exfil(channel: str, output: str) -> bool:
+def has_external_exfil(channel: str, output: str) -> bool:
+
     for raw in extract_urls(channel, output):
+
         value = raw.strip()
 
         if not value:
@@ -228,33 +302,36 @@ def external_exfil(channel: str, output: str) -> bool:
         protocol_relative = value.startswith("//")
 
         # Relative references are allowed.
-        if not protocol_relative and not ANY_SCHEME_RE.match(value):
+        if not protocol_relative and not SCHEME_RE.match(value):
             continue
 
-        candidate = "https:" + value if protocol_relative else value
+        candidate = (
+            "https:" + value
+            if protocol_relative
+            else value
+        )
 
         try:
             parsed = urlsplit(candidate)
             hostname = parsed.hostname
-        except ValueError:
-            # Malformed absolute URL: cannot establish an allowed host.
+        except Exception:
             return True
 
         if not hostname:
             return True
 
-        # IMPORTANT: exact hostname comparison.
+        # Exact hostname comparison.
         if hostname.lower() not in ALLOWED_HOSTS:
             return True
 
     return False
 
 
-# ------------------------------------------------------------
-# Channel rules
-# ------------------------------------------------------------
+# ============================================================
+# HTML
+# ============================================================
 
-SCRIPT_RE = re.compile(
+SCRIPT_TAG_RE = re.compile(
     r"<\s*(?:script|iframe|object|embed)\b",
     re.IGNORECASE,
 )
@@ -264,11 +341,16 @@ EVENT_HANDLER_RE = re.compile(
     re.IGNORECASE,
 )
 
-SQL_RE = re.compile(
+
+# ============================================================
+# SQL
+# ============================================================
+
+SQL_META_RE = re.compile(
     r"""
-    '                       # single quote
+    '
     |
-    "                       # double quote
+    "
     |
     ;
     |
@@ -283,7 +365,12 @@ SQL_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-SHELL_RE = re.compile(
+
+# ============================================================
+# SHELL
+# ============================================================
+
+SHELL_META_RE = re.compile(
     r"""
     [;&|`<>]
     |
@@ -295,90 +382,130 @@ SHELL_RE = re.compile(
 )
 
 
-def check_original(channel: str, output: str) -> str:
+# ============================================================
+# CHANNEL EVALUATION
+# ============================================================
+
+def evaluate(channel: str, output: str) -> str:
 
     if channel == "html":
-        if SCRIPT_RE.search(output):
+
+        if SCRIPT_TAG_RE.search(output):
             return "SCRIPT_TAG"
 
         if EVENT_HANDLER_RE.search(output):
             return "EVENT_HANDLER"
 
-        if dangerous_scheme(channel, output):
+        if has_dangerous_scheme(channel, output):
             return "DANGEROUS_SCHEME"
 
-        if external_exfil(channel, output):
+        if has_external_exfil(channel, output):
             return "EXTERNAL_EXFIL"
 
         return "SAFE"
 
     if channel == "markdown":
-        if dangerous_scheme(channel, output):
+
+        if has_dangerous_scheme(channel, output):
             return "DANGEROUS_SCHEME"
 
-        if external_exfil(channel, output):
+        if has_external_exfil(channel, output):
             return "EXTERNAL_EXFIL"
 
         return "SAFE"
 
     if channel == "url":
-        if dangerous_scheme(channel, output):
+
+        if has_dangerous_scheme(channel, output):
             return "DANGEROUS_SCHEME"
 
-        if external_exfil(channel, output):
+        if has_external_exfil(channel, output):
             return "EXTERNAL_EXFIL"
 
         return "SAFE"
 
     if channel == "sql":
-        return "SQL_METACHAR" if SQL_RE.search(output) else "SAFE"
+        if SQL_META_RE.search(output):
+            return "SQL_METACHAR"
+
+        return "SAFE"
 
     if channel == "shell":
-        return "SHELL_METACHAR" if SHELL_RE.search(output) else "SAFE"
+        if SHELL_META_RE.search(output):
+            return "SHELL_METACHAR"
+
+        return "SAFE"
 
     return "INVALID_SCHEMA"
 
 
-# ------------------------------------------------------------
-# Endpoint
-# ------------------------------------------------------------
+# ============================================================
+# ENDPOINT
+# ============================================================
 
 @app.post("/sanitize-output")
+@app.post("/sanitize-output/")
 async def sanitize_output(request: Request):
 
-    # Do not let FastAPI turn malformed JSON into its own 422 schema.
+    # --------------------------------------------------------
+    # Rule 1: INVALID_SCHEMA
+    # --------------------------------------------------------
+
     try:
         body = await request.json()
     except Exception:
-        return result("INVALID_SCHEMA")
+        return respond("INVALID_SCHEMA")
 
-    # Rule 1
     if not isinstance(body, dict):
-        return result("INVALID_SCHEMA")
+        return respond("INVALID_SCHEMA")
 
     channel = body.get("channel")
     output = body.get("output")
 
     if channel not in CHANNELS:
-        return result("INVALID_SCHEMA")
+        return respond("INVALID_SCHEMA")
 
     if not isinstance(output, str):
-        return result("INVALID_SCHEMA")
+        return respond("INVALID_SCHEMA")
 
     if len(output) > 20000:
-        return result("INVALID_SCHEMA")
+        return respond("INVALID_SCHEMA")
 
-    # Rule 2
+    # --------------------------------------------------------
+    # Rule 2: ENCODED_PAYLOAD
+    # --------------------------------------------------------
+
     decoded = decode_once(output)
 
     if decoded != output:
-        decoded_reason = check_original(channel, decoded)
+
+        decoded_reason = evaluate(
+            channel,
+            decoded,
+        )
 
         if decoded_reason != "SAFE":
-            return result("ENCODED_PAYLOAD")
+            return respond("ENCODED_PAYLOAD")
 
-    # Rule 3
-    return result(check_original(channel, output))
+    # --------------------------------------------------------
+    # Rule 3: ORIGINAL OUTPUT
+    # --------------------------------------------------------
+
+    reason = evaluate(
+        channel,
+        output,
+    )
+
+    return respond(reason)
+
+
+# ============================================================
+# BASIC AVAILABILITY
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 
 @app.get("/healthz")
